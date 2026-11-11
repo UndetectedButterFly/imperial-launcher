@@ -232,5 +232,92 @@ class SyncTests(unittest.TestCase):
         self.assertFalse(matches_any("options.txt.bak", ["options.txt"]))
 
 
+class BundleTests(unittest.TestCase):
+    """Мелкие файлы лежат одним zip-архивом (у GitHub лимит 1000 файлов на релиз)."""
+
+    def setUp(self):
+        self.env = Env()
+        self.g = self.env.game
+
+    def tearDown(self):
+        self.env.close()
+
+    def make(self, version, contents, corrupt_member=None, bad_bundle_hash=False):
+        """contents: {path: bytes}. Кладёт архив на «сервер» и возвращает манифест."""
+        import io
+        import zipfile
+        env = self.env
+        buf = io.BytesIO()
+        entries = []
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for path, data in contents.items():
+                sha = hashlib.sha256(data).hexdigest()
+                z.writestr(sha, b"BROKEN" if sha == corrupt_member else data)
+                entries.append({"path": path, "sha256": sha, "size": len(data), "mode": "once",
+                                "bundle": "b1", "member": sha})
+        raw = buf.getvalue()
+        (env.srv_dir / f"bundle-{version}.zip").write_bytes(raw)
+        bsha = "0" * 64 if bad_bundle_hash else hashlib.sha256(raw).hexdigest()
+        return parse_manifest({
+            "schema": 1, "version": version, "files": entries,
+            "bundles": {"b1": {"url": f"http://127.0.0.1:{env.port}/bundle-{version}.zip",
+                               "sha256": bsha, "size": len(raw)}}})
+
+    def test_install_from_bundle_and_idempotent(self):
+        files = {f"config/f{i}.toml": f"x={i}".encode() for i in range(50)}
+        files["kubejs/server_scripts/a.js"] = b"console.log(1)"
+        m = self.make("1.0", files)
+        r = sync(m, self.g, SyncOptions(workers=3))
+        self.assertTrue(r.ok, r.errors)
+        self.assertEqual(r.downloaded, 51)
+        self.assertEqual((self.g / "config/f7.toml").read_bytes(), b"x=7")
+        self.assertEqual((self.g / "kubejs/server_scripts/a.js").read_bytes(), b"console.log(1)")
+        self.assertEqual(list(self.g.rglob("*.imperial-part")), [])
+        self.assertFalse((self.g / ".imperial/tmp/b1.zip").exists())      # временный архив удалён
+        r2 = sync(m, self.g, SyncOptions())
+        self.assertEqual((r2.downloaded, r2.replaced), (0, 0))
+
+    def test_plan_counts_bundle_size_once(self):
+        files = {f"config/f{i}.toml": f"{i}".encode() * 50 for i in range(10)}
+        m = self.make("1.0", files)
+        from launcher.syncer import build_plan
+        plan = build_plan(m, self.g, SyncOptions())
+        self.assertEqual(plan.bytes_total, m.bundles["b1"]["size"])
+
+    def test_corrupt_member_reports_error_only_for_that_file(self):
+        good, bad = b"GOOD", b"BAD-CONTENT"
+        sha_bad = hashlib.sha256(bad).hexdigest()
+        m = self.make("1.0", {"config/good.toml": good, "config/bad.toml": bad}, corrupt_member=sha_bad)
+        r = sync(m, self.g, SyncOptions())
+        self.assertFalse(r.ok)
+        self.assertTrue((self.g / "config/good.toml").exists())
+        self.assertFalse((self.g / "config/bad.toml").exists())
+        self.assertEqual(len(r.errors), 1)
+        self.assertNotEqual(load_state(self.g)["pack_version"], "1.0")
+
+    def test_wrong_bundle_hash_fails_whole_bundle(self):
+        m = self.make("1.0", {"config/a.toml": b"A", "config/b.toml": b"B"}, bad_bundle_hash=True)
+        r = sync(m, self.g, SyncOptions())
+        self.assertFalse(r.ok)
+        self.assertFalse((self.g / "config/a.toml").exists())
+        self.assertEqual(list(self.g.rglob("*.imperial-part")), [])
+
+    def test_bundle_manifest_validation(self):
+        base = {"schema": 1, "version": "1", "files": [
+            {"path": "a.txt", "sha256": "0" * 64, "size": 1, "mode": "once", "bundle": "nope", "member": "x"}]}
+        with self.assertRaises(ManifestError):
+            parse_manifest(base)
+        ok_b = {"b1": {"url": "https://x/y.zip", "sha256": "0" * 64, "size": 5}}
+        base["bundles"] = ok_b
+        base["files"][0]["bundle"] = "b1"
+        base["files"][0]["member"] = "../evil"
+        with self.assertRaises(ManifestError):
+            parse_manifest(base)
+        base["files"][0]["member"] = "0" * 64
+        self.assertEqual(parse_manifest(base).files[0].bundle, "b1")
+        with self.assertRaises(ManifestError):
+            parse_manifest(dict(base, bundles={"b1": {"url": "ftp://x", "sha256": "0" * 64, "size": 1}}))
+
+
 if __name__ == "__main__":
     unittest.main()

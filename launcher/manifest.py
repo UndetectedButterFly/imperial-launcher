@@ -47,6 +47,8 @@ class FileEntry:
     size: int
     url: str
     mode: str
+    bundle: str = ""    # id архива, где лежит файл (тогда url пустой)
+    member: str = ""    # имя файла внутри архива
 
 
 @dataclass
@@ -69,6 +71,7 @@ class Manifest:
     allow_extra_mods: List[str] = field(default_factory=list)
     files: List[FileEntry] = field(default_factory=list)
     remove: List[str] = field(default_factory=list)
+    bundles: Dict[str, dict] = field(default_factory=dict)   # id -> {"url", "sha256", "size"}
 
 
 def normalize_rel(path: str) -> str:
@@ -154,6 +157,14 @@ def parse_manifest(data: dict, allow_file_urls: bool = False) -> Manifest:
     m.allow_extra_mods = [str(x) for x in data.get("allow_extra_mods", [])]
     if re.search(r'[\\/:*?"<>|]', m.instance_id) or m.instance_id in ("", ".", ".."):
         raise ManifestError("недопустимый instance_id")
+    schemes = ("https://", "http://") + (("file://",) if allow_file_urls else ())
+    for bid, b in (data.get("bundles") or {}).items():
+        if not re.match(r"^[A-Za-z0-9._-]{1,64}$", str(bid)) or not isinstance(b, dict):
+            raise ManifestError(f"неверный архив: {bid}")
+        burl, bsha, bsize = str(b.get("url", "")), str(b.get("sha256", "")).lower(), b.get("size")
+        if not burl.lower().startswith(schemes) or not _SHA.match(bsha) or not isinstance(bsize, int) or bsize < 0:
+            raise ManifestError(f"неверное описание архива {bid}")
+        m.bundles[str(bid)] = {"url": burl, "sha256": bsha, "size": bsize}
     seen = set()
     for raw in _req(data, "files", list):
         if not isinstance(raw, dict):
@@ -169,14 +180,17 @@ def parse_manifest(data: dict, allow_file_urls: bool = False) -> Manifest:
             raise ManifestError(f"неверный размер у {path}")
         if mode not in MODES:
             raise ManifestError(f"неизвестный режим «{mode}» у {path}")
-        schemes = ("https://", "http://") + (("file://",) if allow_file_urls else ())
-        if mode != "ignore" and not url.lower().startswith(schemes):
+        bundle, member = str(raw.get("bundle", "")), str(raw.get("member", ""))
+        if bundle:
+            if bundle not in m.bundles or not re.match(r"^[A-Za-z0-9._-]{1,200}$", member):
+                raise ManifestError(f"неверная ссылка на архив у {path}")
+        elif mode != "ignore" and not url.lower().startswith(schemes):
             raise ManifestError(f"недопустимый адрес у {path}")
         key = path.lower()
         if key in seen:
             raise ManifestError(f"повтор пути: {path}")
         seen.add(key)
-        m.files.append(FileEntry(path, sha, size, url, mode))
+        m.files.append(FileEntry(path, sha, size, url, mode, bundle, member))
     m.remove = [normalize_rel(x) for x in data.get("remove", [])]
     return m
 

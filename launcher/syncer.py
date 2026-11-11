@@ -17,6 +17,7 @@ import os
 import shutil
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -243,7 +244,10 @@ def build_plan(manifest: Manifest, game_dir: Path, opts: SyncOptions,
             else:
                 res.unknown_mods.append(rel)
 
-    res.bytes_total = sum(a.entry.size for a in res.plan if a.kind == "download" and a.entry)
+    dl = [a for a in res.plan if a.kind == "download" and a.entry]
+    used = {a.entry.bundle for a in dl if a.entry.bundle}
+    res.bytes_total = (sum(a.entry.size for a in dl if not a.entry.bundle)
+                       + sum(manifest.bundles[b]["size"] for b in used if b in manifest.bundles))
     return res
 
 
@@ -301,7 +305,12 @@ def sync(manifest: Manifest, game_dir: Path, opts: Optional[SyncOptions] = None,
             sfiles[a.path] = {"sha256": a.entry.sha256, "mode": a.entry.mode}
             res.unchanged += 1
 
-    # 3) загрузки
+    # 3) загрузки: одиночные файлы и архивы с мелкими файлами
+    direct = [a for a in downloads if not a.entry.bundle]
+    grouped: Dict[str, List[Action]] = {}
+    for a in downloads:
+        if a.entry.bundle:
+            grouped.setdefault(a.entry.bundle, []).append(a)
     total = res.bytes_total
     done = 0
     current = ""
@@ -322,31 +331,86 @@ def sync(manifest: Manifest, game_dir: Path, opts: Optional[SyncOptions] = None,
                           on_bytes=on_bytes, cancel=cancel)
         return a
 
-    if downloads:
+    def work_bundle(bid: str, acts: List[Action]):
+        nonlocal current
+        current = f"архив {bid}"
+        b = manifest.bundles[bid]
+        tmp = game_dir / STATE_DIR / "tmp" / f"{bid}.zip"
+        net.download_file(b["url"], tmp, b["sha256"], b["size"], on_bytes=on_bytes, cancel=cancel)
+        good, bad = [], []
+        try:
+            with zipfile.ZipFile(tmp) as zf:
+                for a in acts:
+                    e = a.entry
+                    try:
+                        data = zf.read(e.member)
+                        if len(data) != e.size or hashlib.sha256(data).hexdigest() != e.sha256:
+                            raise ValueError("контрольная сумма файла из архива не совпала")
+                        dest = safe_dest(game_dir, e.path)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        part = dest.with_name(dest.name + ".imperial-part")
+                        part.write_bytes(data)
+                        os.replace(part, dest)
+                        good.append(a)
+                    except PermissionError:
+                        bad.append((a, "файл занят, закройте игру и Freesm"))
+                    except (KeyError, ValueError, OSError, zipfile.BadZipFile) as ex:
+                        bad.append((a, str(ex) or ex.__class__.__name__))
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return good, bad
+
+    def record(a: Action) -> None:
+        e = a.entry
+        sfiles[a.path] = {"sha256": e.sha256, "mode": e.mode}
+        if a.reason == "новый":
+            res.downloaded += 1
+        else:
+            res.replaced += 1
+
+    if direct or grouped:
         with ThreadPoolExecutor(max_workers=max(1, opts.workers)) as pool:
-            futures = {pool.submit(work, a): a for a in downloads}
+            futures = {}
+            for a in direct:
+                futures[pool.submit(work, a)] = ("file", a)
+            for bid, acts in grouped.items():
+                futures[pool.submit(work_bundle, bid, acts)] = ("bundle", (bid, acts))
             try:
                 for fut in as_completed(futures):
-                    a = futures[fut]
-                    try:
-                        fut.result()
-                    except Cancelled:
-                        raise
-                    except PermissionError:
-                        res.errors.append(f"файл занят, закройте игру и Freesm: {a.path}")
-                        continue
-                    except Exception as ex:  # сеть, хэш, диск
-                        res.errors.append(f"{a.path}: {ex}")
-                        log(f"✗ {a.path}: {ex}")
-                        continue
-                    e = a.entry
-                    sfiles[a.path] = {"sha256": e.sha256, "mode": e.mode}
-                    if a.reason == "новый":
-                        res.downloaded += 1
-                        log(f"+ {a.path}")
+                    kind, payload = futures[fut]
+                    if kind == "file":
+                        a = payload
+                        try:
+                            fut.result()
+                        except Cancelled:
+                            raise
+                        except PermissionError:
+                            res.errors.append(f"файл занят, закройте игру и Freesm: {a.path}")
+                            continue
+                        except Exception as ex:  # сеть, хэш, диск
+                            res.errors.append(f"{a.path}: {ex}")
+                            log(f"✗ {a.path}: {ex}")
+                            continue
+                        record(a)
+                        log(f"+ {a.path}" if a.reason == "новый" else f"↻ {a.path} ({a.reason})")
                     else:
-                        res.replaced += 1
-                        log(f"↻ {a.path} ({a.reason})")
+                        bid, acts = payload
+                        try:
+                            good, bad = fut.result()
+                        except Cancelled:
+                            raise
+                        except Exception as ex:
+                            res.errors.append(f"архив {bid}: {ex}")
+                            log(f"✗ архив {bid}: {ex}")
+                            continue
+                        for a in good:
+                            record(a)
+                        for a, why in bad:
+                            res.errors.append(f"{a.path}: {why}")
+                        log(f"+ из архива {bid}: {len(good)} файлов" + (f", ОШИБОК {len(bad)}" if bad else ""))
             except Cancelled:
                 if cancel is not None:
                     cancel.set()

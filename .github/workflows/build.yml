@@ -63,4 +63,5 @@ jobs:
           files: |
             dist/ImperialLauncher.exe
             dist/ImperialLauncher.exe.sha256
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true
