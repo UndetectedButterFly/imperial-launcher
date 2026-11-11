@@ -1,0 +1,66 @@
+name: Сборка лаунчера (Windows)
+
+on:
+  push:
+    tags: ["v*"]          # выпуск: git tag v1.0.0 && git push --tags
+  workflow_dispatch:       # или вручную из вкладки Actions (без выпуска, только проверка сборки)
+
+permissions:
+  contents: write          # нужно, чтобы приложить exe к релизу
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Тесты
+        run: python -m unittest discover -s tests
+
+      - name: Прошить в программу версию и адреса репозиториев
+        shell: bash
+        run: |
+          # репозиторий сборки: переменная репозитория PACK_REPO, иначе <владелец>/imperial-pack
+          PACK="${{ vars.PACK_REPO }}"
+          if [ -z "$PACK" ]; then PACK="${{ github.repository_owner }}/imperial-pack"; fi
+          sed -i "s|\"OWNER/imperial-pack\"|\"$PACK\"|; s|\"OWNER/imperial-launcher\"|\"${{ github.repository }}\"|" launcher/settings.py
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+            sed -i "s|__version__ = \".*\"|__version__ = \"$V\"|" launcher/__init__.py
+          fi
+          grep -n "imperial-" launcher/settings.py | head -4
+          cat launcher/__init__.py
+
+      - name: Сборка exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name ImperialLauncher
+          --icon assets/icon.ico --collect-all customtkinter --add-data "assets;assets" main.py
+
+      - name: Контрольная сумма
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist/ImperialLauncher.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  ImperialLauncher.exe" | Out-File -Encoding ascii dist/ImperialLauncher.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ImperialLauncher
+          path: dist/ImperialLauncher.exe
+
+      - name: Приложить к релизу
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ImperialLauncher.exe
+            dist/ImperialLauncher.exe.sha256
+          generate_release_notes: true
