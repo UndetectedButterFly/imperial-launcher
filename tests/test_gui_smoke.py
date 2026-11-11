@@ -49,7 +49,7 @@ def install_fakes():
     ctk.CTk = FakeCTk
     ctk.set_appearance_mode = MagicMock()
     for name in ("CTkFrame", "CTkLabel", "CTkButton", "CTkEntry", "CTkSwitch", "CTkSlider",
-                 "CTkOptionMenu", "CTkScrollableFrame", "CTkSegmentedButton", "CTkTextbox", "CTkProgressBar", "CTkFont"):
+                 "CTkOptionMenu", "CTkScrollableFrame", "CTkSegmentedButton", "CTkImage", "CTkTextbox", "CTkProgressBar", "CTkFont"):
         setattr(ctk, name, MagicMock())
     sys.modules.update({"tkinter": tk, "tkinter.filedialog": dialogs,
                         "tkinter.messagebox": msg, "customtkinter": ctk})
@@ -194,12 +194,15 @@ class GuiSmoke(unittest.TestCase):
         app._finish()
         self.assertFalse(app.busy)
 
-    def test_gear_math(self):
-        cv = MagicMock()
-        self.gui.draw_gear(cv, 10, 10, 20, 15, 12, 0.5, "#fff", "#000", "#111")
-        self.assertEqual(cv.create_polygon.call_count, 1)
-        pts = cv.create_polygon.call_args[0][0]
-        self.assertEqual(len(pts), 12 * 4 * 2)
+    def test_logo_and_icon(self):
+        app = self.make_app()
+        self.assertTrue(self.gui.asset_path("icon.png").exists())
+        self.assertTrue(self.gui.asset_path("icon.ico").exists())
+        app._set_icon()
+        app.busy = True
+        app._tick_logo()          # покачивание во время работы
+        app.busy = False
+        app._tick_logo()          # возврат на место
 
 
 if __name__ == "__main__":

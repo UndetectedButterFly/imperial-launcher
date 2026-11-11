@@ -1,12 +1,10 @@
 """Окно лаунчера (CustomTkinter).
 
-Идея оформления: тёмный «чугун» и латунь — в тон паровым механизмам Create.
-Единственный акцент — пара шестерён слева: стоят, пока лаунчер ждёт, и вращаются,
-пока идёт установка или обновление (движение отвечает на действие пользователя).
+Тёмный «чугун» и латунь в тон Create; слева логотип сервера. Пока идёт установка или обновление,
+логотип плавно покачивается: так видно, что лаунчер работает.
 """
 from __future__ import annotations
 
-import math
 import queue
 import sys
 import threading
@@ -45,20 +43,10 @@ KIND_FOLDER = "Modrinth App или другая папка"
 NO_PROFILES_LABEL = "Профили Modrinth App не найдены"
 
 
-def draw_gear(cv: tk.Canvas, cx: float, cy: float, r_out: float, r_in: float,
-              teeth: int, angle: float, fill: str, hole: str, bg: str) -> None:
-    step = 2 * math.pi / teeth
-    pts = []
-    for i in range(teeth):
-        a0 = angle + i * step
-        for frac, r in ((0.0, r_in), (0.12, r_out), (0.38, r_out), (0.5, r_in)):
-            a = a0 + frac * step
-            pts += [cx + r * math.cos(a), cy + r * math.sin(a)]
-    cv.create_polygon(pts, fill=fill, outline=BRASS_DARK, width=2)
-    cv.create_oval(cx - r_in * 0.62, cy - r_in * 0.62, cx + r_in * 0.62, cy + r_in * 0.62,
-                   fill=bg, outline=BRASS_DARK, width=2)
-    cv.create_oval(cx - r_in * 0.22, cy - r_in * 0.22, cx + r_in * 0.22, cy + r_in * 0.22,
-                   fill=hole, outline=BRASS_DARK, width=2)
+def asset_path(name: str) -> Path:
+    """Файл из assets: внутри собранного exe (PyInstaller) или рядом с исходниками."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    return base / "assets" / name
 
 
 class App(ctk.CTk):
@@ -78,7 +66,7 @@ class App(ctk.CTk):
         self.manifest: Manifest | None = None
         self.javas: list[javafind.JavaInfo] = []
         self.java_labels: dict[str, str] = {}
-        self.angle = 0.0
+        self._bob = 0
         self.first_install = False
 
         self.f_title = ctk.CTkFont(family=TITLE_FONT, size=36, weight="bold")
@@ -92,17 +80,22 @@ class App(ctk.CTk):
         self._build_left()
         self._build_right()
         self._load_settings_into_widgets()
-        self._draw_gears()
+        self._set_icon()                   # сразу, чтобы CustomTkinter не поставил свою иконку
         self.after(100, self._poll)
-        self.after(300, self._set_icon)
+        self.after(300, self._set_icon)    # и ещё раз на всякий случай
         threading.Thread(target=self._startup_tasks, daemon=True).start()
 
     def _set_icon(self) -> None:
-        try:  # CustomTkinter сам ставит иконку через 200 мс, поэтому позже
-            base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
-            ico = base / "assets" / "icon.ico"
-            if ico.exists() and sys.platform.startswith("win"):
+        """Иконка окна и панели задач: .ico на Windows, .png на остальных системах."""
+        try:
+            ico = asset_path("icon.ico")
+            if sys.platform.startswith("win") and ico.exists():
                 self.iconbitmap(str(ico))
+                return
+            png = asset_path("icon.png")
+            if png.exists():
+                self._icon_photo = tk.PhotoImage(file=str(png))
+                self.iconphoto(True, self._icon_photo)
         except Exception:
             pass
 
@@ -113,8 +106,16 @@ class App(ctk.CTk):
         left.grid_propagate(False)
         left.grid_columnconfigure(0, weight=1)
 
-        self.gears = tk.Canvas(left, width=230, height=170, bg=PANEL, highlightthickness=0)
-        self.gears.grid(row=0, column=0, pady=(26, 4))
+        self.logo_img = None
+        try:
+            from PIL import Image
+            img = Image.open(asset_path("icon.png"))
+            self.logo_img = ctk.CTkImage(light_image=img, dark_image=img, size=(150, 150))
+        except Exception:
+            self.logo_img = None
+        self.logo = ctk.CTkLabel(left, text="" if self.logo_img else "{ ⋈ }", image=self.logo_img,
+                                 font=self.f_title, text_color=BRASS)
+        self.logo.grid(row=0, column=0, pady=(20, 10))
 
         ctk.CTkLabel(left, text="Империя", font=self.f_title, text_color=TEXT).grid(row=1, column=0)
         self.lbl_sub = ctk.CTkLabel(left, text="The Sacred IT Empire", font=self.f_body, text_color=MUTED)
@@ -153,20 +154,15 @@ class App(ctk.CTk):
         ctk.CTkLabel(left, text=f"Лаунчер {__version__}", font=self.f_small, text_color=MUTED
                      ).grid(row=11, column=0, pady=(0, 14))
 
-    def _draw_gears(self) -> None:
-        cv = self.gears
-        cv.delete("all")
-        draw_gear(cv, 98, 84, 66, 54, 12, self.angle, BRASS, PANEL, PANEL)
-        # малая шестерня вращается в обратную сторону и со сдвигом фазы, как в зацеплении
-        draw_gear(cv, 176, 130, 33, 26, 8, -self.angle * 1.5 + math.pi / 8, "#A9B2BC", PANEL, PANEL)
-
-    def _tick_gears(self) -> None:
+    def _tick_logo(self) -> None:
+        """Пока лаунчер работает, логотип плавно покачивается вверх-вниз."""
         if not self.busy:
-            self._draw_gears()
+            self.logo.grid_configure(pady=(20, 10))
             return
-        self.angle += 0.06
-        self._draw_gears()
-        self.after(40, self._tick_gears)
+        self._bob = (self._bob + 1) % 24
+        off = (self._bob if self._bob <= 12 else 24 - self._bob) // 2   # 0..6 и обратно
+        self.logo.grid_configure(pady=(17 + off, 13 - off))
+        self.after(60, self._tick_logo)
 
     # ---------------- правая часть ----------------
     def _build_right(self) -> None:
@@ -761,14 +757,14 @@ class App(ctk.CTk):
         cfg.save(self.s)
         self.busy = True
         self.cancel = threading.Event()
-        self.angle = 0.0
+        self._bob = 0
         self.btn_main.configure(state="disabled")
         self.btn_update.configure(state="disabled")
         self.btn_cancel.grid(row=9, column=0, pady=(10, 0))
         self.bar.set(0)
         self.tabs.set("Журнал")
         self._show_page("Журнал")
-        self._tick_gears()
+        self._tick_logo()
         threading.Thread(target=self._worker, args=(play,), daemon=True).start()
 
     def _worker(self, play: bool) -> None:
@@ -791,7 +787,7 @@ class App(ctk.CTk):
         self.btn_cancel.grid_remove()
         self.btn_main.configure(state="normal")
         self.btn_update.configure(state="normal")
-        self._draw_gears()
+        self.logo.grid_configure(pady=(20, 10))
         threading.Thread(target=self._refresh_manifest, daemon=True).start()
 
     # ---------------- очередь сообщений ----------------
@@ -873,4 +869,10 @@ def _open_path(p: Path) -> None:
 
 
 def run() -> None:
+    if sys.platform.startswith("win"):
+        try:  # своё «имя приложения» для Windows: панель задач берёт иконку лаунчера, а не Python
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Imperial.Launcher")
+        except Exception:
+            pass
     App().mainloop()
